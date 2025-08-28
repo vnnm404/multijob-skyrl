@@ -82,7 +82,7 @@ class BasePPOExp:
         self.tokenizer = self.get_tokenizer()
         self.train_dataset = self.get_train_dataset()
         self.eval_dataset = self.get_eval_dataset()
-        self.colocate_pg = self.get_colocate_pg()
+        # self.colocate_pg = self.get_colocate_pg()
 
     @staticmethod
     def get_cfg_as_str(dict_cfg: DictConfig) -> str:

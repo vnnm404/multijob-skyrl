@@ -6,12 +6,30 @@ Currently runs two of the same job in parallel, each with half the available GPU
 
 """
 
-import hydra
-from omegaconf import DictConfig, OmegaConf
-from skyrl_train.entrypoints.main_base import BasePPOExp, config_dir
-from skyrl_train.utils.utils import initialize_ray
+from ray.util.placement_group import placement_group, PlacementGroup
+
+from transformers import AutoTokenizer
+from skyrl_train.dataset import PromptDataset
+from skyrl_train.utils import validate_cfg
+
+from skyrl_train.trainer import RayPPOTrainer
+from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
+from skyrl_train.inference_engines.remote_inference_engine import create_remote_inference_engines
+from skyrl_train.utils.utils import initialize_ray, get_ray_pg_ready_with_timeout
+from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl_train.generators.base import GeneratorInterface
+from omegaconf import OmegaConf, DictConfig
+from pathlib import Path
 import ray
-from ray.util.placement_group import placement_group
+
+import os
+import hydra
+from loguru import logger
+from skyrl_train.utils.tracking import Tracking
+import multiprocessing as mp
+
+from skyrl_train.entrypoints.main_base import BasePPOExp, config_dir
+from pprint import pprint
 
 
 # NOTE (sumanthrh): We use ray heavily and thus disable `fork` start method.
@@ -23,6 +41,25 @@ mp.set_start_method("spawn", force=True)
 config_dir = str(Path(__file__).parent.parent / "config")
 __all__ = ["BasePPOExp", "config_dir"]
 
+def pretty_print_pg(pg: PlacementGroup):
+    """Pretty print a Ray PlacementGroup object with actual requested resources."""
+    if not isinstance(pg, PlacementGroup):
+        raise TypeError("Expected a ray.util.placement_group.PlacementGroup object")
+
+    info = ray.util.placement_group_table(pg)
+
+    print(f"Placement Group '{info.get('name', '')}' (id={pg.id})")
+    print(f"  State:    {info.get('state', 'UNKNOWN')}")
+    print(f"  Strategy: {info.get('strategy', 'UNKNOWN')}")
+    print(f"  Bundles:")
+
+    for i, bundle in enumerate(info.get("bundles", [])):
+        # bundle is a dict of resources -> amount
+        if isinstance(bundle, dict) and bundle:
+            print(f"    Bundle {i}: {bundle}")
+        else:
+            # fallback if bundle info is missing
+            print(f"    Bundle {i}: (requested: {pg.bundle_specs[i]})")
 
 def get_multi_job_placement_groups(cfg: DictConfig, num_jobs: int = 2, timeout: int = 180):
     """
@@ -40,8 +77,8 @@ def get_multi_job_placement_groups(cfg: DictConfig, num_jobs: int = 2, timeout: 
     resources = ray.cluster_resources()
     available_gpus = int(resources.get("GPU", 0))
     available_nodes = [
-        node for node, res in ray.nodes().items() if res["Alive"]
-    ] if hasattr(ray, "nodes") else None
+        node["NodeID"] for node in ray.nodes() if node.get("Alive", False)
+    ] if hasattr(ray, "nodes") else []
 
     # Naive split: try to split by node if enough nodes, else split GPUs
     pgs = []
@@ -65,6 +102,7 @@ def get_multi_job_placement_groups(cfg: DictConfig, num_jobs: int = 2, timeout: 
             )
             get_ray_pg_ready_with_timeout(pg, timeout=timeout)
             pgs.append(pg)
+
     return pgs
 
 @ray.remote(num_cpus=1)
@@ -75,8 +113,20 @@ def run_job(cfg: DictConfig, pg):
 
 @hydra.main(config_path=config_dir, config_name="ppo_base_config", version_base=None)
 def main(cfg: DictConfig) -> None:
+    pprint(cfg)
+
     initialize_ray(cfg)
     pgs = get_multi_job_placement_groups(cfg, num_jobs=2)
+
+    pretty_print_pg(pgs[0])
+    pretty_print_pg(pgs[1])
+
+    cfg.trainer.placement.policy_num_gpus_per_node //= 2
+    cfg.trainer.placement.ref_num_gpus_per_node //= 2
+    cfg.generator.num_inference_engines //= 2
+
+    # ray.get(run_job.remote(cfg, pgs[0]))
+
     ray.get([
         run_job.remote(cfg, pgs[0]),
         run_job.remote(cfg, pgs[1]),
@@ -84,3 +134,4 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     main()
+
